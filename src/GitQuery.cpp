@@ -122,15 +122,34 @@ bool RunGit(const std::wstring& workingDir, const std::wstring& args, std::strin
     std::vector<wchar_t> mutableCommandLine(commandLine.begin(), commandLine.end());
     mutableCommandLine.push_back(L'\0');
 
+    // Git for Windows' cmd\git.exe is a launcher that starts the real git as a
+    // child process, so run everything in a job object: closing the job (on
+    // any return path) kills the whole process tree, e.g. after a timeout.
+    Handle job;
+    job.h = CreateJobObjectW(nullptr, nullptr);
+    if (!job.h)
+        return false;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(job.h, JobObjectExtendedLimitInformation, &limits, sizeof(limits)))
+        return false;
+
     PROCESS_INFORMATION pi = {};
     if (!CreateProcessW(git.c_str(), mutableCommandLine.data(), nullptr, nullptr, TRUE,
-                        CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS, nullptr, workingDir.c_str(), &si,
-                        &pi))
+                        CREATE_NO_WINDOW | CREATE_SUSPENDED | BELOW_NORMAL_PRIORITY_CLASS, nullptr,
+                        workingDir.c_str(), &si, &pi))
         return false;
 
     Handle process, thread;
     process.h = pi.hProcess;
     thread.h = pi.hThread;
+
+    if (!AssignProcessToJobObject(job.h, process.h))
+    {
+        TerminateProcess(process.h, 1);
+        return false;
+    }
+    ResumeThread(thread.h);
 
     // Close our copy of the write end so ReadFile sees EOF when git exits.
     CloseHandle(writePipe.h);
@@ -167,14 +186,14 @@ bool RunGit(const std::wstring& workingDir, const std::wstring& args, std::strin
 
         if (GetTickCount64() - start > kGitTimeoutMs)
         {
-            TerminateProcess(process.h, 1);
+            TerminateJobObject(job.h, 1);
             return false;
         }
     }
 
     if (!exited && WaitForSingleObject(process.h, kGitTimeoutMs) != WAIT_OBJECT_0)
     {
-        TerminateProcess(process.h, 1);
+        TerminateJobObject(job.h, 1);
         return false;
     }
 
