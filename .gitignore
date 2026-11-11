@@ -43,6 +43,14 @@ build/
 Build/
 build-*/
 
+# Visual Studio and CMake IDE files
+.vs/
+out/
+CMakeSettings.json
+CMakeUserPresets.json
+*.exp
+*.res
+
 # CMake generated files
 CMakeFiles/
 CMakeCache.txt
