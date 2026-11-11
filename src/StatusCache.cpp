@@ -23,23 +23,32 @@ StatusCache::~StatusCache()
 
 RepoStatus StatusCache::Get(const std::wstring& path)
 {
+    return Get(path, path);
+}
+
+RepoStatus StatusCache::Get(const std::wstring& key, const std::wstring& path)
+{
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    auto it = m_entries.find(path);
+    auto it = m_entries.find(key);
     if (it == m_entries.end())
     {
         TrimLocked();
-        it = m_entries.emplace(path, Entry{}).first;
+        it = m_entries.emplace(key, Entry{}).first;
+        it->second.path = path;
     }
 
     Entry& entry = it->second;
     const bool stale = !entry.hasResult || (Clock::now() - entry.checked) >= m_ttl;
     if (stale && !entry.queued && !m_stop)
     {
-        entry.queued = true;
-        m_queue.push_back(path);
+        // Everything that can throw (starting the thread, growing the queue)
+        // comes before the entry is marked, so a failure leaves it untouched
+        // and it is simply tried again on the next lookup.
         if (!m_worker.joinable())
             m_worker = std::thread(&StatusCache::WorkerLoop, this);
+        m_queue.push_back(key);
+        entry.queued = true;
         m_wake.notify_one();
     }
 
@@ -50,6 +59,12 @@ void StatusCache::WaitIdle()
 {
     std::unique_lock<std::mutex> lock(m_mutex);
     m_idle.wait(lock, [this] { return m_stop || (m_queue.empty() && !m_busy); });
+}
+
+size_t StatusCache::Size() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_entries.size();
 }
 
 void StatusCache::TrimLocked()
@@ -77,8 +92,21 @@ void StatusCache::WorkerLoop()
         if (m_stop)
             break;
 
-        std::wstring path = std::move(m_queue.front());
-        m_queue.pop_front();
+        // Newest first: the folder Explorer asked about last is the one most
+        // likely still on screen, so it should not wait behind folders the user
+        // has already scrolled or navigated away from.
+        std::wstring key = std::move(m_queue.back());
+        m_queue.pop_back();
+
+        auto it = m_entries.find(key);
+        if (it == m_entries.end())
+        {
+            // Not expected: queued entries are never trimmed.
+            if (m_queue.empty())
+                m_idle.notify_all();
+            continue;
+        }
+        const std::wstring path = it->second.path;
         m_busy = true;
 
         lock.unlock();
@@ -93,14 +121,14 @@ void StatusCache::WorkerLoop()
         lock.lock();
 
         bool changed = false;
-        auto it = m_entries.find(path);
+        it = m_entries.find(key);
         if (it != m_entries.end())
         {
             Entry& entry = it->second;
-            // Plain folders never show a badge, so there is nothing to redraw
-            // when an unchecked folder turns out not to be a repository.
-            changed = entry.status != status &&
-                      !(entry.status == RepoStatus::Unknown && status == RepoStatus::NotRepo);
+            // Only a change in what is drawn needs a redraw: a plain folder
+            // turning out not to be a repository, or one error turning into
+            // another, looks the same before and after.
+            changed = entry.status != status && (HasOverlay(entry.status) || HasOverlay(status));
             entry.status = status;
             entry.checked = Clock::now();
             entry.hasResult = true;

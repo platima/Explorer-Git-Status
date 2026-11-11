@@ -14,12 +14,20 @@
 
 namespace
 {
-std::wstring NormalisePath(PCWSTR path)
+// The path as Explorer spelled it, minus trailing separators ("C:\" is kept
+// intact). This is what git and the shell are given.
+std::wstring TrimPath(PCWSTR path)
 {
-    std::wstring key(path);
-    // Keep "C:\" intact, but strip trailing separators elsewhere.
-    while (key.size() > 3 && (key.back() == L'\\' || key.back() == L'/'))
-        key.pop_back();
+    std::wstring trimmed(path);
+    while (trimmed.size() > 3 && (trimmed.back() == L'\\' || trimmed.back() == L'/'))
+        trimmed.pop_back();
+    return trimmed;
+}
+
+// Case-insensitive cache key for a trimmed path. Only used for lookups.
+std::wstring CacheKey(const std::wstring& trimmed)
+{
+    std::wstring key(trimmed);
     if (!key.empty())
         CharLowerBuffW(&key[0], static_cast<DWORD>(key.size()));
     return key;
@@ -77,11 +85,18 @@ IFACEMETHODIMP OverlayHandler::IsMemberOf(PCWSTR path, DWORD attributes)
     if (attributes & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS))
         return S_FALSE;
 
+    // Network paths are not checked: looking for `.git` on a share that is
+    // unreachable can block the single background worker for tens of seconds,
+    // which would hold up the badges for every local folder as well.
+    if (IsUncPath(path))
+        return S_FALSE;
+
     try
     {
         // Non-blocking: returns the cached value and schedules a background
         // refresh if needed, so Explorer never waits on git.
-        RepoStatus status = GetStatusCache().Get(NormalisePath(path));
+        const std::wstring trimmed = TrimPath(path);
+        RepoStatus status = GetStatusCache().Get(CacheKey(trimmed), trimmed);
         return status == m_info.status ? S_OK : S_FALSE;
     }
     catch (...)
