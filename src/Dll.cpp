@@ -14,8 +14,9 @@ DEFINE_GUID(CLSID_GitStatusModified, 0xd5935fba, 0x49fe, 0x4239, 0x8b, 0x45, 0xc
 // {76A9C9D1-B37A-4981-8087-F6B516EEE41C}
 DEFINE_GUID(CLSID_GitStatusAheadBehind, 0x76a9c9d1, 0xb37a, 0x4981, 0x80, 0x87, 0xf6, 0xb5, 0x16, 0xee, 0xe4, 0x1c);
 
-// Explorer only uses the first ~15 overlay identifiers, sorted by name, so the
-// names start with spaces (as OneDrive, Dropbox and TortoiseGit also do).
+// Windows has 15 overlay slots and reserves 4 of them, so only the first 11
+// registered identifiers, sorted by name, are used. The names start with
+// spaces so that they sort early.
 const OverlayInfo g_overlays[] = {
     { &CLSID_GitStatusClean, L"   GitStatus1Clean", L"Explorer Git Status - Clean", RepoStatus::Clean, 0 },
     { &CLSID_GitStatusModified, L"   GitStatus2Modified", L"Explorer Git Status - Modified", RepoStatus::Modified, 1 },
@@ -38,6 +39,14 @@ INIT_ONCE g_cacheInit = INIT_ONCE_STATIC_INIT;
 
 BOOL CALLBACK CreateCache(PINIT_ONCE, PVOID, PVOID*)
 {
+    // The cache runs a worker thread in this DLL for the rest of the process's
+    // life, so the DLL must never be unloaded. DllCanUnloadNow says so, but
+    // that is only advisory; pinning the module makes FreeLibrary a no-op.
+    HMODULE pinned = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                            reinterpret_cast<LPCWSTR>(&CreateCache), &pinned))
+        return FALSE;
+
     g_cache = new (std::nothrow) StatusCache(
         &QueryRepoStatus,
         [](const std::wstring& path) {
@@ -84,11 +93,10 @@ StatusCache& GetStatusCache()
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
+    // DisableThreadLibraryCalls is deliberately not used: the statically linked
+    // C runtime needs the thread attach and detach notifications.
     if (reason == DLL_PROCESS_ATTACH)
-    {
         g_module = module;
-        DisableThreadLibraryCalls(module);
-    }
     return TRUE;
 }
 
@@ -153,14 +161,25 @@ STDAPI DllRegisterServer()
 
 STDAPI DllUnregisterServer()
 {
+    // Try every delete, and report the first real failure (typically "access
+    // denied" from a prompt that is not elevated). Keys that are already gone
+    // are fine, so unregistering twice is harmless.
+    LONG firstError = ERROR_SUCCESS;
+    auto note = [&firstError](LONG rc) {
+        if (rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND)
+            rc = ERROR_SUCCESS;
+        if (firstError == ERROR_SUCCESS)
+            firstError = rc;
+    };
+
     for (size_t i = 0; i < g_overlayCount; ++i)
     {
         const OverlayInfo& info = g_overlays[i];
         const std::wstring clsid = GuidToString(*info.clsid);
 
-        RegDeleteTreeW(HKEY_LOCAL_MACHINE, (std::wstring(kOverlayKey) + info.registryName).c_str());
-        RegDeleteTreeW(HKEY_LOCAL_MACHINE, (L"Software\\Classes\\CLSID\\" + clsid).c_str());
-        RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, kApprovedKey, clsid.c_str());
+        note(RegDeleteTreeW(HKEY_LOCAL_MACHINE, (std::wstring(kOverlayKey) + info.registryName).c_str()));
+        note(RegDeleteTreeW(HKEY_LOCAL_MACHINE, (L"Software\\Classes\\CLSID\\" + clsid).c_str()));
+        note(RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, kApprovedKey, clsid.c_str()));
     }
-    return S_OK;
+    return HRESULT_FROM_WIN32(firstError);
 }
