@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The parser and cache build and run anywhere.
+  portable-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      # The cache is all about threads, so run the tests under ThreadSanitizer too.
+      - name: Lower address space randomisation for ThreadSanitizer
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Configure (ThreadSanitizer, warnings on)
+        run: cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=thread -g -Wall -Wextra"
+      - name: Build (ThreadSanitizer)
+        run: cmake --build build-tsan
+      - name: Test (ThreadSanitizer)
+        run: ctest --test-dir build-tsan --output-on-failure
+
+  # MSVC is the primary toolchain. This job builds the DLL, runs the portable
+  # tests and the Windows integration tests (real git.exe, DLL loaded by path),
+  # then checks the DLL itself and registers and unregisters it. Hosted runners
+  # are throwaway administrator machines, so registering there is safe.
+  windows-msvc:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure -V
+
+      - name: Check exports and runtime dependencies
+        shell: pwsh
+        run: |
+          $dll = (Resolve-Path build\Release\ExplorerGitStatus.dll).Path
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products * -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          if (-not $dumpbin) { throw 'dumpbin.exe not found' }
+
+          $exports = & $dumpbin /exports $dll | Out-String
+          foreach ($name in 'DllCanUnloadNow', 'DllGetClassObject', 'DllRegisterServer', 'DllUnregisterServer') {
+            if ($exports -notmatch $name) { throw "missing export $name" }
+          }
+
+          # The C runtime is linked statically, so no redistributable is needed.
+          $dependents = & $dumpbin /dependents $dll | Out-String
+          Write-Host $dependents
+          if ($dependents -match '(?i)vcruntime|msvcp|ucrtbase|api-ms-win-crt') {
+            throw 'the DLL depends on the dynamic C runtime'
+          }
+
+      - name: Register and unregister
+        shell: pwsh
+        run: |
+          $dll = (Resolve-Path build\Release\ExplorerGitStatus.dll).Path
+          $overlays = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers'
+          $names = '   GitStatus1Clean', '   GitStatus2Modified', '   GitStatus3AheadBehind'
+
+          # regsvr32 is a GUI program, so PowerShell would not wait for it or set
+          # $LASTEXITCODE; start it explicitly and wait.
+          function Invoke-Regsvr32($arguments) {
+            $process = Start-Process -FilePath regsvr32.exe -ArgumentList $arguments -Wait -PassThru
+            return $process.ExitCode
+          }
+
+          $code = Invoke-Regsvr32 @('/s', "`"$dll`"")
+          if ($code -ne 0) { throw "regsvr32 failed with $code" }
+
+          $clsids = @()
+          foreach ($name in $names) {
+            $key = Get-Item -LiteralPath (Join-Path $overlays $name)
+            $clsid = $key.GetValue('')
+            $clsids += $clsid
+            $server = Get-Item -LiteralPath "HKLM:\SOFTWARE\Classes\CLSID\$clsid\InprocServer32"
+            if ($server.GetValue('') -ine $dll) { throw "wrong server path for $name" }
+            if ($server.GetValue('ThreadingModel') -ne 'Apartment') { throw "wrong threading model for $name" }
+          }
+
+          $code = Invoke-Regsvr32 @('/u', '/s', "`"$dll`"")
+          if ($code -ne 0) { throw "regsvr32 /u failed with $code" }
+          foreach ($name in $names) {
+            if (Test-Path -LiteralPath (Join-Path $overlays $name)) { throw "$name was left behind" }
+          }
+          foreach ($clsid in $clsids) {
+            if (Test-Path -LiteralPath "HKLM:\SOFTWARE\Classes\CLSID\$clsid") { throw "$clsid was left behind" }
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ExplorerGitStatus-x64
+          path: build/Release/ExplorerGitStatus.dll
+          if-no-files-found: error
+
+  # Keeps the MinGW-w64 route in the README working. Compile only: the DLL
+  # cannot be loaded on a Linux runner.
+  mingw-cross-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW-w64
+        run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64-posix
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++-posix \
+            -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
+      - name: Build
+        run: cmake --build build
