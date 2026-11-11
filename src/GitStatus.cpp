@@ -49,6 +49,13 @@ RepoStatus ParsePorcelainV2(const std::string& output)
     return aheadBehind ? RepoStatus::AheadBehind : RepoStatus::Clean;
 }
 
+const wchar_t* const kUntrustedConfigPattern =
+    L"^(filter\\..*\\.(clean|process)"
+    L"|lfs\\.extension\\..*"
+    L"|include\\..*"
+    L"|includeif\\..*"
+    L"|core\\.(excludesfile|attributesfile))$";
+
 bool HasRepositoryScopedEntries(const std::string& configOutput)
 {
     std::istringstream stream(configOutput);
@@ -61,4 +68,21 @@ bool HasRepositoryScopedEntries(const std::string& configOutput)
             return true;
     }
     return false;
+}
+
+bool IsUncPath(const std::wstring& path)
+{
+    return path.size() >= 2 && (path[0] == L'\\' || path[0] == L'/') && (path[1] == L'\\' || path[1] == L'/');
+}
+
+bool IsUncGitdirPointer(const std::string& dotGitFile)
+{
+    // Git reads `gitdir: <path>` from the start of the file and strips the
+    // trailing line ending.
+    const std::string prefix = "gitdir: ";
+    if (dotGitFile.compare(0, prefix.size(), prefix) != 0)
+        return false;
+    const size_t begin = prefix.size();
+    return dotGitFile.size() >= begin + 2 && (dotGitFile[begin] == '\\' || dotGitFile[begin] == '/') &&
+           (dotGitFile[begin + 1] == '\\' || dotGitFile[begin + 1] == '/');
 }
